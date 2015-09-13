@@ -170,21 +170,18 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                                                                   {common_name,
                                                                    State#state.common_name}]) of
                 {ok, SecurityContext} ->
-                    lager:debug("authentication for ~p from ~p succeeded",
-                               [User, PeerIP]),
                     AuthResp = riak_pb_codec:msg_code(rpbauthresp),
                     Transport:send(Socket, <<1:32/unsigned-big, AuthResp:8>>),
                     {next_state, connected,
                      State#state{security=SecurityContext}};
                 {error, Reason} ->
                     %% Allow the client to reauthenticate, I guess?
+                    log_login_event(failure, MsgData, User, Reason),
 
                     %% Add a delay to make brute-force attempts more annoying
                     timer:sleep(5000),
                     State1 = send_error_and_flush("Authentication failed",
                                                   State),
-                    lager:debug("authentication for ~p from ~p failed: ~p",
-                               [User, PeerIP, Reason]),
                     case State#state.retries of
                         N when N =< 1 ->
                             %% no more chances
@@ -195,6 +192,7 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                     end
             end;
         _ ->
+            log_login_event(failure, MsgData, unknown, "no authentication message received"),
             State1 = send_error_and_flush("Security is enabled, please "
                                           "authenticate first", State),
             {next_state, wait_for_auth, State1}
@@ -228,10 +226,12 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
                                 case riak_core_security:check_permissions(
                                         Permissions, SecCtx) of
                                     {true, NewCtx} ->
+                                        log_login_event(success, MsgData, riak_core_security:get_username(State#state.security)),
                                         process_message(Service, Message,
                                                         ServiceState,
                                                         State#state{security=NewCtx});
                                     {false, Error, NewCtx} ->
+                                        log_login_event(failure, MsgData, riak_core_security:get_username(SecCtx), Error),
                                         send_error(Error,
                                                    [],
                                                    State#state{security=NewCtx})
@@ -525,6 +525,13 @@ send_error_and_flush(Error, State) ->
 format_peername({IP, Port}) ->
     io_lib:format("~s:~B", [inet_parse:ntoa(IP), Port]).
 
+%% @doc log PB login attempts
+log_login_event(success, Data, User) ->
+    login:info("Succesful login for pb ~p request for user: ~p from host: ~p. Query info: ~p with tokens: ~p",
+        [Data, User, Data, Data, Data]).
+log_login_event(failure, Data, User, Reason) ->
+    login:error("Failed login for pb ~p request for user ~p from host: ~p with reason: ~p. Query info: ~p with tokens: ~p",
+        [Data, User, Data, Reason, Data, Data]).
 -ifdef(TEST).
 
 -include("riak_api_pb_registrar.hrl").

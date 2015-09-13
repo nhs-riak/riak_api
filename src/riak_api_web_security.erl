@@ -1,7 +1,7 @@
 %% @doc Some security helper functions for Riak API endpoints
 -module(riak_api_web_security).
 
--export([is_authorized/1]).
+-export([is_authorized/1,log_login_event/3,log_login_event/4]).
 
 %% @doc Check if the user is authorized
 -spec is_authorized(any()) -> {true, any()} | false | insecure.
@@ -22,18 +22,29 @@ is_authorized(ReqData) ->
                                 of
                                 {ok, Sec} ->
                                     {true, Sec};
-                                {error, _} ->
+                                {error, Reason} ->
+                                    log_login_event(failure, ReqData, User, Reason),
                                     false
                             end;
                         _ ->
+                            log_login_event(failure, ReqData, unknown, "missing Authorization header"),
                             false
                     end;
                 false ->
                     %% security is enabled, but they're connecting over HTTP.
                     %% which means if they authed, the credentials would be in
                     %% plaintext
+                    log_login_event(failure, ReqData, unknown, "insecure request when security is enabled"),
                     insecure
             end;
         false ->
             {true, undefined} %% no security context
     end.
+
+%% @doc log HTTP login attempts
+log_login_event(success, ReqData, User) ->
+    login:info("Succesful login for http ~p request for user: ~p from host: ~p. Query info: ~p with tokens: ~p",
+        [wrq:method(ReqData), User, wrq:peer(ReqData), wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
+log_login_event(failure, ReqData, User, Reason) ->
+    login:error("Failed login for http ~p request for user: ~p from host: ~p with reason: ~p. Query info: ~p with tokens: ~p",
+        [wrq:method(ReqData), User, wrq:peer(ReqData), Reason, wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
