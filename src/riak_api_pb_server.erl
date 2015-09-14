@@ -32,6 +32,7 @@
 
 -include_lib("riak_pb/include/riak_pb.hrl").
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("riak_pb/include/riak_kv_pb.hrl").
 
 -behaviour(gen_fsm).
 
@@ -176,7 +177,7 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                      State#state{security=SecurityContext}};
                 {error, Reason} ->
                     %% Allow the client to reauthenticate, I guess?
-                    log_login_event(failure, MsgData, User, Reason),
+                    log_login_event(failure, State, User, Reason),
 
                     %% Add a delay to make brute-force attempts more annoying
                     timer:sleep(5000),
@@ -192,7 +193,7 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                     end
             end;
         _ ->
-            log_login_event(failure, MsgData, unknown, "no authentication message received"),
+            log_login_event(failure, State, unknown, "no authentication message received"),
             State1 = send_error_and_flush("Security is enabled, please "
                                           "authenticate first", State),
             {next_state, wait_for_auth, State1}
@@ -226,12 +227,12 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
                                 case riak_core_security:check_permissions(
                                         Permissions, SecCtx) of
                                     {true, NewCtx} ->
-                                        log_login_event(success, MsgData, riak_core_security:get_username(State#state.security)),
+                                        log_login_event(success, State, get_username(SecCtx)),
                                         process_message(Service, Message,
                                                         ServiceState,
                                                         State#state{security=NewCtx});
                                     {false, Error, NewCtx} ->
-                                        log_login_event(failure, MsgData, riak_core_security:get_username(SecCtx), Error),
+                                        log_login_event(failure, State, get_username(SecCtx), Error),
                                         send_error(Error,
                                                    [],
                                                    State#state{security=NewCtx})
@@ -391,14 +392,17 @@ process_message(Service, Message, ServiceState, ServerState) ->
             update_service_state(Service, NewServiceState, ServiceState, ServerState#state{req={Service,ReqId,NewServiceState}});
         %% Normal reply
         {reply, ReplyMessage, NewServiceState} ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security)),
             ServerState1 = send_encoded_message_or_error(Service, ReplyMessage, ServerState),
             update_service_state(Service, NewServiceState, ServiceState, ServerState1);
         %% Recoverable error
         {error, ErrorMessage, NewServiceState} ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security), ErrorMessage),
             ServerState1 = send_error(ErrorMessage, ServerState),
             update_service_state(Service, NewServiceState, ServiceState, ServerState1);
         %% Result is broken
         Other ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security), Other),
             send_error("Unknown PB service response: ~p", [Other], ServerState)
     end.
 
@@ -423,20 +427,25 @@ process_stream(Service, ReqId, Message, ServiceState0, State) ->
             update_service_state(Service, ServiceState, ServiceState0, State1);
         %% Stop the stream with multiple final replies
         {done, Replies, ServiceState} when is_list(Replies) ->
+            log_access_event(Message, State, get_username(State#state.security)),
             State1 = send_all(Service, Replies, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream with a final reply
         {done, Reply, ServiceState} ->
+            log_access_event(Message, State, get_username(State#state.security)),
             State1 = send_encoded_message_or_error(Service, Reply, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream without sending a client reply
         {done, ServiceState} ->
+            log_access_event(Message, State, get_username(State#state.security)),
             update_service_state(Service, ServiceState, ServiceState0, State#state{req=undefined});
         %% Send the client normal errors
         {error, Reason, ServiceState} ->
+            log_access_event(Message, State, get_username(State#state.security), Reason),
             State1 = send_error(Reason, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         Other ->
+            log_access_event(Message, State, get_username(State#state.security), Other),
             send_error("Unknown PB service response: ~p", [Other], State)
     end.
 
@@ -525,13 +534,30 @@ send_error_and_flush(Error, State) ->
 format_peername({IP, Port}) ->
     io_lib:format("~s:~B", [inet_parse:ntoa(IP), Port]).
 
+get_username(undefined) ->
+    undefined;
+get_username(SecCtx) ->
+    riak_core_security:get_username(SecCtx).
+
 %% @doc log PB login attempts
-log_login_event(success, Data, User) ->
+log_login_event(success, State, User) ->
     login:info("Succesful login for pb ~p request for user: ~p from host: ~p. Query info: ~p with tokens: ~p",
-        [Data, User, Data, Data, Data]).
-log_login_event(failure, Data, User, Reason) ->
+        [State, User, State, State, State]).
+log_login_event(failure, State, User, Reason) ->
     login:error("Failed login for pb ~p request for user ~p from host: ~p with reason: ~p. Query info: ~p with tokens: ~p",
-        [Data, User, Data, Reason, Data, Data]).
+        [State, User, State, Reason, State, State]).
+
+%% @doc log PB requests
+log_access_event(#rpbgetreq{}=Message, State, User) ->
+    access:info("Succesful pb access for riak_kv.get request for user ~p from host: ~p. Parameters: ~p",
+        [User, State#state.peername, {Message#rpbgetreq.type, Message#rpbgetreq.bucket, Message#rpbgetreq.key}]);
+log_access_event(Message, State, User) ->
+    access:info("Succesful pb access for ~p request for user ~p from host: ~p. Parameters: ~p",
+        [State#state.req, User, State#state.peername, Message]).
+log_access_event(Message, State, User, Reason) ->
+    access:error("Failed pb access for ~p request for user ~p from host: ~p with reason: ~p. Parameters: ~p",
+        [State, User, State, Reason, Message]).
+
 -ifdef(TEST).
 
 -include("riak_api_pb_registrar.hrl").
