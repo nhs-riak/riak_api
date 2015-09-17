@@ -43,8 +43,8 @@ is_authorized(ReqData) ->
 
 %% @doc log HTTP login attempts
 log_login_event(success, ReqData, User) ->
-    login:info("Succesful login for http ~p request for user: ~p from host: ~p. Query info: ~p with tokens: ~p",
-        [wrq:method(ReqData), User, wrq:peer(ReqData), wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
+    login:info("Successful login for http ~p request against path: ~p for user: ~s from host: ~s. Query info: ~p with tokens: ~p",
+        [wrq:method(ReqData), wrq:raw_path(ReqData), User, wrq:peer(ReqData), wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
 log_login_event(failure, ReqData, User, Reason) ->
-    login:error("Failed login for http ~p request for user: ~p from host: ~p with reason: ~p. Query info: ~p with tokens: ~p",
-        [wrq:method(ReqData), User, wrq:peer(ReqData), Reason, wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
+    login:error("Failed login for http ~p request against path: ~p for user: ~s from host: ~s with reason: ~p. Query info: ~p with tokens: ~p",
+        [wrq:method(ReqData), wrq:raw_path(ReqData), User, wrq:peer(ReqData), Reason, wrq:path_info(ReqData), wrq:path_tokens(ReqData)]).
