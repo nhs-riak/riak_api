@@ -546,7 +546,7 @@ get_username(SecCtx) ->
 get_recordreqs() ->
     [rpbpingreq,rpbgetreq,rpbputreq,rpbdelreq,rpblistbucketsreq,rpblistkeysreq,rpbgetbucketreq,
     rpbsetbucketreq,rpbmapredreq,rpbindexreq,rpbsearchqueryreq,rpbresetbucketreq,rpbgetbuckettypereq,
-    rpbsetbuckettypereq,rpbgetbucketkeypreflistreq,rpbcsbucketreq,rpbcounterupdatereq,rpbcountergetreq,
+    rpbsetbuckettypereq,rpbcsbucketreq,rpbcounterupdatereq,rpbcountergetreq,
     rpbyokozunaindexgetreq,rpbyokozunaindexputreq,rpbyokozunaindexdeletereq,rpbyokozunaschemagetreq,
     rpbyokozunaschemaputreq,dtfetchreq,dtupdatereq].
 
@@ -620,10 +620,6 @@ log_permissions_event(#rpbgetbuckettypereq{}=Message, State, User) ->
 log_permissions_event(#rpbsetbuckettypereq{}=Message, State, User) ->
     login:info("Successful pb login for riak_core.set_bucket_type request by user ~s from host: ~s. Type: ~p",
         [User, format_peername(State#state.peername), Message#rpbsetbuckettypereq.type]);
-log_permissions_event(#rpbgetbucketkeypreflistreq{}=Message, State, User) ->
-    login:info("Successful pb login for riak_kv.get_preflist request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
-        [User, format_peername(State#state.peername), Message#rpbgetbucketkeypreflistreq.type, 
-        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
 log_permissions_event(#rpbcsbucketreq{}=Message, State, User) ->
     login:info("Successful pb login for riak_cs.get_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
         [User, format_peername(State#state.peername), Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
@@ -703,10 +699,6 @@ log_permissions_event(#rpbgetbuckettypereq{}=Message, State, User, Reason) ->
 log_permissions_event(#rpbsetbuckettypereq{}=Message, State, User, Reason) ->
     login:error("Failed pb login for riak_core.set_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
         [User, format_peername(State#state.peername), Reason, Message#rpbsetbuckettypereq.type]);
-log_permissions_event(#rpbgetbucketkeypreflistreq{}=Message, State, User, Reason) ->
-    login:error("Failed pb login for riak_kv.get_preflist request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
-        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketkeypreflistreq.type, 
-        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
 log_permissions_event(#rpbcsbucketreq{}=Message, State, User, Reason) ->
     login:error("Failed pb login for riak_cs.get_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
         [User, format_peername(State#state.peername), Reason, Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
@@ -787,10 +779,6 @@ log_access_event(#rpbgetbuckettypereq{}=Message, State, User) ->
 log_access_event(#rpbsetbuckettypereq{}=Message, State, User) ->
     access:info("Successful pb access for riak_core.set_bucket_type request by user ~s from host: ~s. Type: ~p",
         [User, format_peername(State#state.peername), Message#rpbsetbuckettypereq.type]);
-log_access_event(#rpbgetbucketkeypreflistreq{}=Message, State, User) ->
-    access:info("Successful pb access for riak_kv.get_preflist request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
-        [User, format_peername(State#state.peername), Message#rpbgetbucketkeypreflistreq.type, 
-        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
 log_access_event(#rpbcsbucketreq{}=Message, State, User) ->
     access:info("Successful pb access for riak_cs.get_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
         [User, format_peername(State#state.peername), Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
@@ -873,10 +861,6 @@ log_access_event(#rpbgetbuckettypereq{}=Message, State, User, Reason) ->
 log_access_event(#rpbsetbuckettypereq{}=Message, State, User, Reason) ->
     access:error("Failed pb access for riak_core.set_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
         [User, format_peername(State#state.peername), Reason, Message#rpbsetbuckettypereq.type]);
-log_access_event(#rpbgetbucketkeypreflistreq{}=Message, State, User, Reason) ->
-    access:error("Failed pb access for riak_kv.get_preflist request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
-        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketkeypreflistreq.type, 
-        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
 log_access_event(#rpbcsbucketreq{}=Message, State, User, Reason) ->
     access:error("Failed pb access for riak_cs.get_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
         [User, format_peername(State#state.peername), Reason, Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
