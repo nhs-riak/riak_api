@@ -31,7 +31,11 @@
 -endif.
 
 -include_lib("riak_pb/include/riak_pb.hrl").
+-include_lib("riak_pb/include/riak_search_pb.hrl").
 -include_lib("public_key/include/public_key.hrl").
+-include_lib("riak_pb/include/riak_kv_pb.hrl").
+-include_lib("riak_pb/include/riak_dt_pb.hrl").
+-include_lib("riak_pb/include/riak_yokozuna_pb.hrl").
 
 -behaviour(gen_fsm).
 
@@ -170,21 +174,18 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                                                                   {common_name,
                                                                    State#state.common_name}]) of
                 {ok, SecurityContext} ->
-                    lager:debug("authentication for ~p from ~p succeeded",
-                               [User, PeerIP]),
                     AuthResp = riak_pb_codec:msg_code(rpbauthresp),
                     Transport:send(Socket, <<1:32/unsigned-big, AuthResp:8>>),
                     {next_state, connected,
                      State#state{security=SecurityContext}};
                 {error, Reason} ->
                     %% Allow the client to reauthenticate, I guess?
+                    log_auth_error(State, User, Reason),
 
                     %% Add a delay to make brute-force attempts more annoying
                     timer:sleep(5000),
                     State1 = send_error_and_flush("Authentication failed",
                                                   State),
-                    lager:debug("authentication for ~p from ~p failed: ~p",
-                               [User, PeerIP, Reason]),
                     case State#state.retries of
                         N when N =< 1 ->
                             %% no more chances
@@ -195,6 +196,7 @@ wait_for_auth({msg, MsgCode, MsgData}, State=#state{socket=Socket,
                     end
             end;
         _ ->
+            log_auth_error(State, unknown, "no authentication message received"),
             State1 = send_error_and_flush("Security is enabled, please "
                                           "authenticate first", State),
             {next_state, wait_for_auth, State1}
@@ -228,16 +230,19 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
                                 case riak_core_security:check_permissions(
                                         Permissions, SecCtx) of
                                     {true, NewCtx} ->
+                                        log_permissions_event(Message, State, get_username(SecCtx)),
                                         process_message(Service, Message,
                                                         ServiceState,
                                                         State#state{security=NewCtx});
                                     {false, Error, NewCtx} ->
+                                        log_permissions_event(Message, State, get_username(SecCtx), Error),
                                         send_error(Error,
                                                    [],
                                                    State#state{security=NewCtx})
                                 end
                         end;
                     {error, Reason} ->
+                        log_auth_error(State, get_username(State#state.security), Reason),
                         send_error("Message decoding error: ~p", [Reason], State)
                 end;
             error ->
@@ -391,14 +396,17 @@ process_message(Service, Message, ServiceState, ServerState) ->
             update_service_state(Service, NewServiceState, ServiceState, ServerState#state{req={Service,ReqId,NewServiceState}});
         %% Normal reply
         {reply, ReplyMessage, NewServiceState} ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security)),
             ServerState1 = send_encoded_message_or_error(Service, ReplyMessage, ServerState),
             update_service_state(Service, NewServiceState, ServiceState, ServerState1);
         %% Recoverable error
         {error, ErrorMessage, NewServiceState} ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security), ErrorMessage),
             ServerState1 = send_error(ErrorMessage, ServerState),
             update_service_state(Service, NewServiceState, ServiceState, ServerState1);
         %% Result is broken
         Other ->
+            log_access_event(Message, ServerState, get_username(ServerState#state.security), Other),
             send_error("Unknown PB service response: ~p", [Other], ServerState)
     end.
 
@@ -423,20 +431,25 @@ process_stream(Service, ReqId, Message, ServiceState0, State) ->
             update_service_state(Service, ServiceState, ServiceState0, State1);
         %% Stop the stream with multiple final replies
         {done, Replies, ServiceState} when is_list(Replies) ->
+            route_stream_log(Message, State, get_username(State#state.security)),
             State1 = send_all(Service, Replies, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream with a final reply
         {done, Reply, ServiceState} ->
+            route_stream_log(Message, State, get_username(State#state.security)),
             State1 = send_encoded_message_or_error(Service, Reply, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream without sending a client reply
         {done, ServiceState} ->
+            route_stream_log(Message, State, get_username(State#state.security)),
             update_service_state(Service, ServiceState, ServiceState0, State#state{req=undefined});
         %% Send the client normal errors
         {error, Reason, ServiceState} ->
+            route_stream_log(Message, State, get_username(State#state.security), Reason),
             State1 = send_error(Reason, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         Other ->
+            route_stream_log(Message, State, get_username(State#state.security), Other),
             send_error("Unknown PB service response: ~p", [Other], State)
     end.
 
@@ -524,6 +537,380 @@ send_error_and_flush(Error, State) ->
 
 format_peername({IP, Port}) ->
     io_lib:format("~s:~B", [inet_parse:ntoa(IP), Port]).
+
+get_username(undefined) ->
+    unknown;
+get_username(SecCtx) ->
+    riak_core_security:get_username(SecCtx).
+
+get_recordreqs() ->
+    [rpbpingreq,rpbgetreq,rpbputreq,rpbdelreq,rpblistbucketsreq,rpblistkeysreq,rpbgetbucketreq,
+    rpbsetbucketreq,rpbmapredreq,rpbindexreq,rpbsearchqueryreq,rpbresetbucketreq,rpbgetbuckettypereq,
+    rpbsetbuckettypereq,rpbgetbucketkeypreflistreq,rpbcsbucketreq,rpbcounterupdatereq,rpbcountergetreq,
+    rpbyokozunaindexgetreq,rpbyokozunaindexputreq,rpbyokozunaindexdeletereq,rpbyokozunaschemagetreq,
+    rpbyokozunaschemaputreq,dtfetchreq,dtupdatereq].
+
+%% @doc log any failed authorization attempts
+log_auth_error(State, User, Reason) ->
+    login:error("Failed authorization for pb access by user ~s from host: ~s with reason: ~p",
+        [User, format_peername(State#state.peername), Reason]).
+
+%% @doc route stream log by iterating through state.req
+route_stream_log(_Message, State, User) ->
+    case lists:keyfind(state, 1, tuple_to_list(State#state.req)) of
+        false ->
+            log_access_event([], State, User);
+        NewState ->
+            S = [lists:keyfind(Record, 1, tuple_to_list(NewState)) || Record <- get_recordreqs()],
+            [Req] = [E||E <- S, E/=false],
+            log_access_event(Req, State, User)
+    end.
+
+route_stream_log(_Message, State, User, Reason) ->
+    case lists:keyfind(state, 1, tuple_to_list(State#state.req)) of
+        false ->
+            log_access_event([], State, User, Reason);
+        NewState ->
+            S = [lists:keyfind(Record, 1, tuple_to_list(NewState)) || Record <- get_recordreqs()],
+            [Req] = [E||E <- S, E/=false],
+            log_access_event(Req, State, User, Reason)
+    end.
+
+%% @doc log successful PB logons
+log_permissions_event(rpbpingreq, State, User) ->
+    login:info("Successful pb login for ping request by user ~s from host: ~s.",
+        [User, format_peername(State#state.peername)]);
+log_permissions_event(#rpbgetreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.get request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetreq.type, Message#rpbgetreq.bucket, Message#rpbgetreq.key]);
+log_permissions_event(#rpbputreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.put request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbputreq.type, Message#rpbputreq.bucket, Message#rpbputreq.key]);
+log_permissions_event(#rpbdelreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.delete request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbdelreq.type, Message#rpbdelreq.bucket, Message#rpbdelreq.key]);
+log_permissions_event(#rpblistbucketsreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.list_buckets request by user ~s from host: ~s. Bucket type: ~p",
+        [User, format_peername(State#state.peername), Message#rpblistbucketsreq.type]);
+log_permissions_event(#rpblistkeysreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.list_keys request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpblistkeysreq.type, Message#rpblistkeysreq.bucket]);
+log_permissions_event(#rpbgetbucketreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_core.get_bucket request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbucketreq.type, Message#rpbgetbucketreq.bucket]);
+log_permissions_event(#rpbsetbucketreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_core.set_bucket request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsetbucketreq.type, Message#rpbsetbucketreq.bucket]);
+log_permissions_event(#rpbmapredreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.mapreduce request by user ~s from host: ~s. Request: ~p",
+        [User, format_peername(State#state.peername), Message#rpbmapredreq.request]);
+log_permissions_event(#rpbindexreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.index request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Query type: ~p Key: ~p Range_min: ~p Range_max: ~p",
+        [User, format_peername(State#state.peername), Message#rpbindexreq.type, Message#rpbindexreq.bucket, Message#rpbindexreq.qtype,
+        Message#rpbindexreq.key, Message#rpbindexreq.range_min, Message#rpbindexreq.range_max]);
+log_permissions_event(#rpbsearchqueryreq{}=Message, State, User) ->
+    login:info("Successful pb login for search.query request by user ~s from host: ~s. Query: ~p Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsearchqueryreq.q, Message#rpbsearchqueryreq.index]);
+log_permissions_event(#rpbresetbucketreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_core.reset_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbresetbucketreq.type, Message#rpbresetbucketreq.bucket]);
+log_permissions_event(#rpbgetbuckettypereq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_core.get_bucket_type request by user ~s from host: ~s. Type: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbuckettypereq.type]);
+log_permissions_event(#rpbsetbuckettypereq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_core.set_bucket_type request by user ~s from host: ~s. Type: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsetbuckettypereq.type]);
+log_permissions_event(#rpbgetbucketkeypreflistreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.get_preflist request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbucketkeypreflistreq.type, 
+        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
+log_permissions_event(#rpbcsbucketreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_cs.get_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
+        Message#rpbcsbucketreq.start_key, Message#rpbcsbucketreq.end_key]);
+log_permissions_event(#rpbcounterupdatereq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.update_counter request by user ~s from host: ~s. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcounterupdatereq.bucket, Message#rpbcounterupdatereq.key]);
+log_permissions_event(#rpbcountergetreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_kv.get_counter request by user ~s from host: ~s. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcountergetreq.bucket, Message#rpbcountergetreq.key]);
+log_permissions_event(#rpbyokozunaindexgetreq{}=Message, State, User) ->
+    login:info("Successful pb login for search.get_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexgetreq.name]);
+log_permissions_event(#rpbyokozunaindexputreq{}=Message, State, User) ->
+    login:info("Successful pb login for search.put_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexputreq.index]);
+log_permissions_event(#rpbyokozunaindexdeletereq{}=Message, State, User) ->
+    login:info("Successful pb login for search.delete_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexdeletereq.name]);
+log_permissions_event(#rpbyokozunaschemagetreq{}=Message, State, User) ->
+    login:info("Successful pb login for search.schema_get request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaschemagetreq.name]);
+log_permissions_event(#rpbyokozunaschemaputreq{}=Message, State, User) ->
+    login:info("Successful pb login for search.schema_put request by user ~s from host: ~s. Schema: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaschemaputreq.schema]);
+log_permissions_event(#dtfetchreq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_dt.get request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#dtfetchreq.type, Message#dtfetchreq.bucket, Message#dtfetchreq.key]);
+log_permissions_event(#dtupdatereq{}=Message, State, User) ->
+    login:info("Successful pb login for riak_dt.put request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#dtupdatereq.type, Message#dtupdatereq.bucket, Message#dtupdatereq.key]);
+log_permissions_event(Message, State, User) ->
+    login:warning("Successful pb login for unknown request by user ~s from host: ~s. Full request message: ~p",
+        [User, format_peername(State#state.peername), Message]).
+
+%% @doc log failed pb login requests
+log_permissions_event(rpbpingreq, State, User, Reason) ->
+    login:error("Failed pb login for ping request by user ~s from host: ~s with reason: ~p.",
+        [User, format_peername(State#state.peername), Reason]);
+log_permissions_event(#rpbgetreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.get request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetreq.type, Message#rpbgetreq.bucket, Message#rpbgetreq.key]);
+log_permissions_event(#rpbputreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.put request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbputreq.type, Message#rpbputreq.bucket, Message#rpbputreq.key]);
+log_permissions_event(#rpbdelreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.delete request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbdelreq.type, Message#rpbdelreq.bucket, Message#rpbdelreq.key]);
+log_permissions_event(#rpblistbucketsreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.list_buckets request by user ~s from host: ~s with reason: ~p. Bucket type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpblistbucketsreq.type]);
+log_permissions_event(#rpblistkeysreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.list_keys request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpblistkeysreq.type, Message#rpblistkeysreq.bucket]);
+log_permissions_event(#rpbgetbucketreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_core.get_bucket request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketreq.type, Message#rpbgetbucketreq.bucket]);
+log_permissions_event(#rpbsetbucketreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_core.set_bucket request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsetbucketreq.type, Message#rpbsetbucketreq.bucket]);
+log_permissions_event(#rpbmapredreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.mapreduce request by user ~s from host: ~s with reason: ~p. Request: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbmapredreq.request]);
+log_permissions_event(#rpbindexreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.index request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Query type: ~p Key: ~p Range_min: ~p Range_max: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbindexreq.type, Message#rpbindexreq.bucket, Message#rpbindexreq.qtype,
+        Message#rpbindexreq.key, Message#rpbindexreq.range_min, Message#rpbindexreq.range_max]);
+log_permissions_event(#rpbsearchqueryreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.query request by user ~s from host: ~s with reason: ~p. Query: ~p Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsearchqueryreq.q, Message#rpbsearchqueryreq.index]);
+log_permissions_event(#rpbresetbucketreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_core.reset_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbresetbucketreq.type, Message#rpbresetbucketreq.bucket]);
+log_permissions_event(#rpbgetbuckettypereq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_core.get_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbuckettypereq.type]);
+log_permissions_event(#rpbsetbuckettypereq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_core.set_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsetbuckettypereq.type]);
+log_permissions_event(#rpbgetbucketkeypreflistreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.get_preflist request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketkeypreflistreq.type, 
+        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
+log_permissions_event(#rpbcsbucketreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_cs.get_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
+        Message#rpbcsbucketreq.start_key, Message#rpbcsbucketreq.end_key]);
+log_permissions_event(#rpbcounterupdatereq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.update_counter request by user ~s from host: ~s with reason: ~p. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcounterupdatereq.bucket, Message#rpbcounterupdatereq.key]);
+log_permissions_event(#rpbcountergetreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_kv.get_counter request by user ~s from host: ~s with reason: ~p. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcountergetreq.bucket, Message#rpbcountergetreq.key]);
+log_permissions_event(#rpbyokozunaindexgetreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.get_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexgetreq.name]);
+log_permissions_event(#rpbyokozunaindexputreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.put_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexputreq.index]);
+log_permissions_event(#rpbyokozunaindexdeletereq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.delete_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexdeletereq.name]);
+log_permissions_event(#rpbyokozunaschemagetreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.schema_get request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaschemagetreq.name]);
+log_permissions_event(#rpbyokozunaschemaputreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for search.schema_put request by user ~s from host: ~s with reason: ~p. Schema: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaschemaputreq.schema]);
+log_permissions_event(#dtfetchreq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_dt.get request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#dtfetchreq.type, Message#dtfetchreq.bucket, Message#dtfetchreq.key]);
+log_permissions_event(#dtupdatereq{}=Message, State, User, Reason) ->
+    login:error("Failed pb login for riak_dt.put request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#dtupdatereq.type, Message#dtupdatereq.bucket, Message#dtupdatereq.key]);
+log_permissions_event(Message, State, User, Reason) ->
+    login:error("Failed pb login for unknown request by user ~s from host: ~s with reason: ~p. Full request message: ~p",
+        [User, format_peername(State#state.peername), Reason, Message]).
+
+
+%% @doc log successful PB access requests
+log_access_event(rpbpingreq, State, User) ->
+    access:info("Successful pb access for ping request by user ~s from host: ~s.",
+        [User, format_peername(State#state.peername)]);
+log_access_event(#rpbgetreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.get request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetreq.type, Message#rpbgetreq.bucket, Message#rpbgetreq.key]);
+log_access_event(#rpbputreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.put request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbputreq.type, Message#rpbputreq.bucket, Message#rpbputreq.key]);
+log_access_event(#rpbdelreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.delete request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbdelreq.type, Message#rpbdelreq.bucket, Message#rpbdelreq.key]);
+log_access_event(#rpblistbucketsreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.list_buckets request by user ~s from host: ~s. Bucket type: ~p",
+        [User, format_peername(State#state.peername), Message#rpblistbucketsreq.type]);
+log_access_event(#rpblistkeysreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.list_keys request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpblistkeysreq.type, Message#rpblistkeysreq.bucket]);
+log_access_event(#rpbgetbucketreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_core.get_bucket request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbucketreq.type, Message#rpbgetbucketreq.bucket]);
+log_access_event(#rpbsetbucketreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_core.set_bucket request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsetbucketreq.type, Message#rpbsetbucketreq.bucket]);
+log_access_event(#rpbmapredreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.mapreduce request by user ~s from host: ~s. Request: ~p",
+        [User, format_peername(State#state.peername), Message#rpbmapredreq.request]);
+log_access_event(#rpbindexreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.index request by user ~s from host: ~s. Bucket type: ~p Bucket: ~p Query type: ~p Key: ~p Range_min: ~p Range_max: ~p",
+        [User, format_peername(State#state.peername), Message#rpbindexreq.type, Message#rpbindexreq.bucket, Message#rpbindexreq.qtype,
+        Message#rpbindexreq.key, Message#rpbindexreq.range_min, Message#rpbindexreq.range_max]);
+log_access_event(#rpbsearchqueryreq{}=Message, State, User) ->
+    access:info("Successful pb access for search.query request by user ~s from host: ~s. Query: ~p Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsearchqueryreq.q, Message#rpbsearchqueryreq.index]);
+log_access_event(#rpbresetbucketreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_core.reset_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Message#rpbresetbucketreq.type, Message#rpbresetbucketreq.bucket]);
+log_access_event(#rpbgetbuckettypereq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_core.get_bucket_type request by user ~s from host: ~s. Type: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbuckettypereq.type]);
+log_access_event(#rpbsetbuckettypereq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_core.set_bucket_type request by user ~s from host: ~s. Type: ~p",
+        [User, format_peername(State#state.peername), Message#rpbsetbuckettypereq.type]);
+log_access_event(#rpbgetbucketkeypreflistreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.get_preflist request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbgetbucketkeypreflistreq.type, 
+        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
+log_access_event(#rpbcsbucketreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_cs.get_bucket request by user ~s from host: ~s. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
+        Message#rpbcsbucketreq.start_key, Message#rpbcsbucketreq.end_key]);
+log_access_event(#rpbcounterupdatereq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.update_counter request by user ~s from host: ~s. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcounterupdatereq.bucket, Message#rpbcounterupdatereq.key]);
+log_access_event(#rpbcountergetreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_kv.get_counter request by user ~s from host: ~s. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#rpbcountergetreq.bucket, Message#rpbcountergetreq.key]);
+log_access_event(#rpbyokozunaindexgetreq{}=Message, State, User) ->
+    access:info("Successful pb access for search.get_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexgetreq.name]);
+log_access_event(#rpbyokozunaindexputreq{}=Message, State, User) ->
+    access:info("Successful pb access for search.put_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexputreq.index]);
+log_access_event(#rpbyokozunaindexdeletereq{}=Message, State, User) ->
+    access:info("Successful pb access for search.delete_index request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaindexdeletereq.name]);
+log_access_event(#rpbyokozunaschemagetreq{}=Message, State, User) ->
+    access:info("Successful pb access for search.schema_get request by user ~s from host: ~s. Index: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaschemagetreq.name]);
+log_access_event(#rpbyokozunaschemaputreq{}=Message, State, User) ->
+    access:info("Successful pb access for search.schema_put request by user ~s from host: ~s. Schema: ~p",
+        [User, format_peername(State#state.peername), Message#rpbyokozunaschemaputreq.schema]);
+log_access_event(#dtfetchreq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_dt.get request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#dtfetchreq.type, Message#dtfetchreq.bucket, Message#dtfetchreq.key]);
+log_access_event(#dtupdatereq{}=Message, State, User) ->
+    access:info("Successful pb access for riak_dt.put request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Message#dtupdatereq.type, Message#dtupdatereq.bucket, Message#dtupdatereq.key]);
+log_access_event([], State, User) ->
+    access:info("Successful pb access for unknown request by user ~s from host: ~s",
+        [User, format_peername(State#state.peername)]);
+log_access_event(Message, State, User) ->
+    access:warning("Successful pb access for unknown request by user ~s from host: ~s. Full request message: ~p",
+        [User, format_peername(State#state.peername), Message]).
+
+%% @doc log failed PB access requests
+log_access_event(rpbpingreq, State, User, Reason) ->
+    access:error("Failed pb access for ping request by user ~s from host: ~s with reason: ~p.",
+        [User, format_peername(State#state.peername), Reason]);
+log_access_event(#rpbgetreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.get request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetreq.type, Message#rpbgetreq.bucket, Message#rpbgetreq.key]);
+log_access_event(#rpbputreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.put request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbputreq.type, Message#rpbputreq.bucket, Message#rpbputreq.key]);
+log_access_event(#rpbdelreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.delete request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbdelreq.type, Message#rpbdelreq.bucket, Message#rpbdelreq.key]);
+log_access_event(#rpblistbucketsreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.list_buckets request by user ~s from host: ~s with reason: ~p. Bucket type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpblistbucketsreq.type]);
+log_access_event(#rpblistkeysreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.list_keys request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpblistkeysreq.type, Message#rpblistkeysreq.bucket]);
+log_access_event(#rpbgetbucketreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_core.get_bucket request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketreq.type, Message#rpbgetbucketreq.bucket]);
+log_access_event(#rpbsetbucketreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_core.set_bucket request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsetbucketreq.type, Message#rpbsetbucketreq.bucket]);
+log_access_event(#rpbmapredreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.mapreduce request by user ~s from host: ~s with reason: ~p. Request: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbmapredreq.request]);
+log_access_event(#rpbindexreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.index request by user ~s from host: ~s with reason: ~p. Bucket type: ~p Bucket: ~p Query type: ~p Key: ~p Range_min: ~p Range_max: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbindexreq.type, Message#rpbindexreq.bucket, Message#rpbindexreq.qtype,
+        Message#rpbindexreq.key, Message#rpbindexreq.range_min, Message#rpbindexreq.range_max]);
+log_access_event(#rpbsearchqueryreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.query request by user ~s from host: ~s with reason: ~p. Query: ~p Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsearchqueryreq.q, Message#rpbsearchqueryreq.index]);
+log_access_event(#rpbresetbucketreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_core.reset_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbresetbucketreq.type, Message#rpbresetbucketreq.bucket]);
+log_access_event(#rpbgetbuckettypereq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_core.get_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbuckettypereq.type]);
+log_access_event(#rpbsetbuckettypereq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_core.set_bucket_type request by user ~s from host: ~s with reason: ~p. Type: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbsetbuckettypereq.type]);
+log_access_event(#rpbgetbucketkeypreflistreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.get_preflist request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbgetbucketkeypreflistreq.type, 
+        Message#rpbgetbucketkeypreflistreq.bucket, Message#rpbgetbucketkeypreflistreq.key]);
+log_access_event(#rpbcsbucketreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_cs.get_bucket request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Start_key: ~p End_key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcsbucketreq.type, Message#rpbcsbucketreq.bucket, 
+        Message#rpbcsbucketreq.start_key, Message#rpbcsbucketreq.end_key]);
+log_access_event(#rpbcounterupdatereq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.update_counter request by user ~s from host: ~s with reason: ~p. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcounterupdatereq.bucket, Message#rpbcounterupdatereq.key]);
+log_access_event(#rpbcountergetreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_kv.get_counter request by user ~s from host: ~s with reason: ~p. Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbcountergetreq.bucket, Message#rpbcountergetreq.key]);
+log_access_event(#rpbyokozunaindexgetreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.get_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexgetreq.name]);
+log_access_event(#rpbyokozunaindexputreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.put_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexputreq.index]);
+log_access_event(#rpbyokozunaindexdeletereq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.delete_index request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaindexdeletereq.name]);
+log_access_event(#rpbyokozunaschemagetreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.schema_get request by user ~s from host: ~s with reason: ~p. Index: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaschemagetreq.name]);
+log_access_event(#rpbyokozunaschemaputreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for search.schema_put request by user ~s from host: ~s with reason: ~p. Schema: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#rpbyokozunaschemaputreq.schema]);
+log_access_event(#dtfetchreq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_dt.get request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#dtfetchreq.type, Message#dtfetchreq.bucket, Message#dtfetchreq.key]);
+log_access_event(#dtupdatereq{}=Message, State, User, Reason) ->
+    access:error("Failed pb access for riak_dt.put request by user ~s from host: ~s with reason: ~p. Type: ~p Bucket: ~p Key: ~p",
+        [User, format_peername(State#state.peername), Reason, Message#dtupdatereq.type, Message#dtupdatereq.bucket, Message#dtupdatereq.key]);
+log_access_event(Message, State, User, Reason) ->
+    access:error("Failed pb access for unknown request by user ~s from host: ~s with reason: ~p. Full request message: ~p",
+        [User, format_peername(State#state.peername), Reason, Message]).
 
 -ifdef(TEST).
 
