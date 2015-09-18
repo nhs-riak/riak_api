@@ -35,6 +35,7 @@
 -include_lib("public_key/include/public_key.hrl").
 -include_lib("riak_pb/include/riak_kv_pb.hrl").
 -include_lib("riak_pb/include/riak_dt_pb.hrl").
+-include_lib("riak_pb/include/riak_yokozuna_pb.hrl").
 
 -behaviour(gen_fsm).
 
@@ -241,7 +242,7 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
                                 end
                         end;
                     {error, Reason} ->
-                        log_auth_error(State, get_username(State#state.security), Reason)
+                        log_auth_error(State, get_username(State#state.security), Reason),
                         send_error("Message decoding error: ~p", [Reason], State)
                 end;
             error ->
@@ -430,25 +431,25 @@ process_stream(Service, ReqId, Message, ServiceState0, State) ->
             update_service_state(Service, ServiceState, ServiceState0, State1);
         %% Stop the stream with multiple final replies
         {done, Replies, ServiceState} when is_list(Replies) ->
-            log_access_event(Message, State, get_username(State#state.security)),
+            route_stream_log(Message, State, get_username(State#state.security)),
             State1 = send_all(Service, Replies, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream with a final reply
         {done, Reply, ServiceState} ->
-            log_access_event(Message, State, get_username(State#state.security)),
+            route_stream_log(Message, State, get_username(State#state.security)),
             State1 = send_encoded_message_or_error(Service, Reply, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         %% Stop the stream without sending a client reply
         {done, ServiceState} ->
-            log_access_event(Message, State, get_username(State#state.security)),
+            route_stream_log(Message, State, get_username(State#state.security)),
             update_service_state(Service, ServiceState, ServiceState0, State#state{req=undefined});
         %% Send the client normal errors
         {error, Reason, ServiceState} ->
-            log_access_event(Message, State, get_username(State#state.security), Reason),
+            route_stream_log(Message, State, get_username(State#state.security), Reason),
             State1 = send_error(Reason, State),
             update_service_state(Service, ServiceState, ServiceState0, State1#state{req=undefined});
         Other ->
-            log_access_event(Message, State, get_username(State#state.security), Other),
+            route_stream_log(Message, State, get_username(State#state.security), Other),
             send_error("Unknown PB service response: ~p", [Other], State)
     end.
 
@@ -542,23 +543,41 @@ get_username(undefined) ->
 get_username(SecCtx) ->
     riak_core_security:get_username(SecCtx).
 
+get_recordreqs() ->
+    [rpbpingreq,rpbgetreq,rpbputreq,rpbdelreq,rpblistbucketsreq,rpblistkeysreq,rpbgetbucketreq,
+    rpbsetbucketreq,rpbmapredreq,rpbindexreq,rpbsearchqueryreq,rpbresetbucketreq,rpbgetbuckettypereq,
+    rpbsetbuckettypereq,rpbgetbucketkeypreflistreq,rpbcsbucketreq,rpbcounterupdatereq,rpbcountergetreq,
+    rpbyokozunaindexgetreq,rpbyokozunaindexputreq,rpbyokozunaindexdeletereq,rpbyokozunaschemagetreq,
+    rpbyokozunaschemaputreq,dtfetchreq,dtupdatereq].
+
 %% @doc log any failed authorization attempts
 log_auth_error(State, User, Reason) ->
     login:error("Failed authorization for pb access by user ~s from host: ~s with reason: ~p",
         [User, format_peername(State#state.peername), Reason]).
 
-%% @doc log successful PB logons 
-log_permissions_event(Message, State, User) ->
-    login:info("Successful login for pb ~p request by user: ~s from host: ~s. Query info: ~p with tokens: ~p",
-        [State, User, State, State, State]).
-%% @doc log failed PB logons
-log_permissions_event(Message, State, User, Reason) ->
-    login:error("Failed login for pb ~p request by user ~s from host: ~s with reason: ~p. Query info: ~p with tokens: ~p",
-        [State, User, State, Reason, State, State]).
+%% @doc route stream log by iterating through state.req
+route_stream_log(_Message, State, User) ->
+    case lists:keyfind(state, 1, tuple_to_list(State#state.req)) of
+        false ->
+            log_access_event([], State, User);
+        NewState ->
+            S = [lists:keyfind(Record, 1, tuple_to_list(NewState)) || Record <- get_recordreqs()],
+            [Req] = [E||E <- S, E/=false],
+            log_access_event(Req, State, User)
+    end.
 
+route_stream_log(_Message, State, User, Reason) ->
+    case lists:keyfind(state, 1, tuple_to_list(State#state.req)) of
+        false ->
+            log_access_event([], State, User, Reason);
+        NewState ->
+            S = [lists:keyfind(Record, 1, tuple_to_list(NewState)) || Record <- get_recordreqs()],
+            [Req] = [E||E <- S, E/=false],
+            log_access_event(Req, State, User, Reason)
+    end.
 
 %% @doc log successful PB logons
-log_permissions_event(#rpbpingreq{}, State, User) ->
+log_permissions_event(rpbpingreq, State, User) ->
     login:info("Successful pb login for ping request by user ~s from host: ~s.",
         [User, format_peername(State#state.peername)]);
 log_permissions_event(#rpbgetreq{}=Message, State, User) ->
@@ -641,7 +660,7 @@ log_permissions_event(Message, State, User) ->
         [User, format_peername(State#state.peername), Message]).
 
 %% @doc log failed pb login requests
-log_permissions_event(#rpbpingreq{}, State, User, Reason) ->
+log_permissions_event(rpbpingreq, State, User, Reason) ->
     login:error("Failed pb login for ping request by user ~s from host: ~s with reason: ~p.",
         [User, format_peername(State#state.peername), Reason]);
 log_permissions_event(#rpbgetreq{}=Message, State, User, Reason) ->
@@ -723,10 +742,9 @@ log_permissions_event(Message, State, User, Reason) ->
     login:error("Failed pb login for unknown request by user ~s from host: ~s with reason: ~p. Full request message: ~p",
         [User, format_peername(State#state.peername), Reason, Message]).
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %% @doc log successful PB access requests
-log_access_event(#rpbpingreq{}, State, User) ->
+log_access_event(rpbpingreq, State, User) ->
     access:info("Successful pb access for ping request by user ~s from host: ~s.",
         [User, format_peername(State#state.peername)]);
 log_access_event(#rpbgetreq{}=Message, State, User) ->
@@ -804,12 +822,15 @@ log_access_event(#dtfetchreq{}=Message, State, User) ->
 log_access_event(#dtupdatereq{}=Message, State, User) ->
     access:info("Successful pb access for riak_dt.put request by user ~s from host: ~s. Type: ~p Bucket: ~p Key: ~p",
         [User, format_peername(State#state.peername), Message#dtupdatereq.type, Message#dtupdatereq.bucket, Message#dtupdatereq.key]);
+log_access_event([], State, User) ->
+    access:info("Successful pb access for unknown request by user ~s from host: ~s",
+        [User, format_peername(State#state.peername)]);
 log_access_event(Message, State, User) ->
     access:warning("Successful pb access for unknown request by user ~s from host: ~s. Full request message: ~p",
         [User, format_peername(State#state.peername), Message]).
 
 %% @doc log failed PB access requests
-log_access_event(#rpbpingreq{}, State, User, Reason) ->
+log_access_event(rpbpingreq, State, User, Reason) ->
     access:error("Failed pb access for ping request by user ~s from host: ~s with reason: ~p.",
         [User, format_peername(State#state.peername), Reason]);
 log_access_event(#rpbgetreq{}=Message, State, User, Reason) ->
