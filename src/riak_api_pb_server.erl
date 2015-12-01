@@ -211,43 +211,32 @@ connected(timeout, State=#state{outbuffer=Buffer}) ->
     {next_state, connected, flush(Data, State#state{outbuffer=NewBuffer})};
 connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
     try
-        %% First find the appropriate service module to dispatch
-        NewState = case riak_api_pb_registrar:lookup(MsgCode) of
-            {ok, Service} ->
-                ServiceState = orddict:fetch(Service, ServiceStates),
-                %% Decode the message according to the service
-                case Service:decode(MsgCode, MsgData) of
-                    {ok, Message} ->
-                        %% Process the message
-                        process_message(Service, Message, ServiceState, State);
-                    {ok, Message, Permissions} ->
-                        case State#state.security of
-                            undefined ->
-                                process_message(Service, Message, ServiceState, State);
-                            SecCtx ->
-                                case riak_core_security:check_permissions(
-                                        Permissions, SecCtx) of
-                                    {true, NewCtx} ->
-                                        process_message(Service, Message,
-                                                        ServiceState,
-                                                        State#state{security=NewCtx});
-                                    {false, Error, NewCtx} ->
-                                        send_error(Error,
-                                                   [],
-                                                   State#state{security=NewCtx})
-                                end
-                        end;
-                    {error, Reason} ->
-                        send_error("Message decoding error: ~p", [Reason], State)
-                end;
-            error ->
-                case riak_pb_codec:msg_code(rpbstarttls) of
-                    MsgCode ->
-                        send_error("Security not enabled; STARTTLS not allowed.", State);
-                    _ ->
-                        send_error("Unknown message code: ~p", [MsgCode], State)
-                end
-        end,
+	Service = riak_kv_pb_timeseries,
+	ServiceState = orddict:fetch(Service, ServiceStates),
+	%% Decode the message according to the service
+	NewState = case Service:decode_term_to_binary(MsgCode, MsgData) of
+	    {ok, Message} ->
+		%% Process the message
+		process_message(Service, Message, ServiceState, State);
+	    {ok, Message, Permissions} ->
+		case State#state.security of
+		    undefined ->
+			process_message(Service, Message, ServiceState, State);
+		    SecCtx ->
+			case riak_core_security:check_permissions(Permissions, SecCtx) of
+			    {true, NewCtx} ->
+				process_message(Service, Message,
+						ServiceState,
+						State#state{security=NewCtx});
+			    {false, Error, NewCtx} ->
+				send_error(Error,
+					   [],
+					   State#state{security=NewCtx})
+			end
+		end;
+	    {error, Reason} ->
+		send_error("Message decoding error: ~p", [Reason], State)
+	end,
         {next_state, connected, NewState}
     catch
         %% Tell the client we errored before closing the connection.
