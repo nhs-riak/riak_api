@@ -214,7 +214,7 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
 	Service = riak_kv_pb_timeseries,
 	ServiceState = orddict:fetch(Service, ServiceStates),
 	%% Decode the message according to the service
-	NewState = case Service:decode_term_to_binary(MsgCode, MsgData) of
+	NewState = case Service:decode(MsgCode, MsgData) of
 	    {ok, Message} ->
 		%% Process the message
 		process_message(Service, Message, ServiceState, State);
