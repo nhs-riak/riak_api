@@ -61,6 +61,8 @@
 -type format() :: {format, term()} | {format, io:format(), [term()]}.
 -export_type([format/0]).
 
+-include_lib("profiler/include/profiler.hrl").
+
 %% Protobuf message code for switching between protobuf and native
 %% Erlang encoding.
 -define(PB_TOGGLE_ENCODING, 110).
@@ -88,6 +90,7 @@ service_registered(Pid, Mod) ->
 %% riak_api_pb_server.
 -spec init(list()) -> {ok, wait_for_socket, #state{}}.
 init([]) ->
+    profiler:perf_profile({prefix, "/Users/eml/projects/riak/riak_test/riak_test_query/server_profiler_results"}),
     riak_api_stat:update(pbc_connect),
     ServiceStates = lists:foldl(fun(Service, States) ->
                                         orddict:store(Service, Service:init(), States)
@@ -240,6 +243,8 @@ connected({msg, ?PB_TOGGLE_ENCODING, MsgData}, State) ->
             {stop, {Type, Failure, Trace}, FState}
     end;
 connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
+    profiler:perf_profile({start, 0, ?FNNAME()}),
+    Ret = 
     try
         %% First find the appropriate service module to dispatch
         NewState = case riak_api_pb_registrar:lookup(MsgCode) of
@@ -286,7 +291,9 @@ connected({msg, MsgCode, MsgData}, State=#state{states=ServiceStates}) ->
             FState = send_error_and_flush({format, "Error processing incoming message: ~p:~p:~p",
                                            [Type, Failure, Trace]}, State),
             {stop, {Type, Failure, Trace}, FState}
-    end;
+    end,
+    profiler:perf_profile({stop, 0}),
+    Ret;
 connected(_Event, State) ->
     {next_state, connected, State}.
 
@@ -415,6 +422,8 @@ decode_buffer(StateName, State=#state{socket=Socket,
 %% and decoded.
 -spec process_message(atom(), term(), term(), #state{}) -> #state{}.
 process_message(Service, Message, ServiceState, ServerState) ->
+    profiler:perf_profile({start, 1, ?FNNAME()}),
+    Ret = 
     case Service:process(Message, ServiceState) of
         %% Streaming reply with reference
         {reply, {stream, ReqId}, NewServiceState} ->
@@ -430,7 +439,9 @@ process_message(Service, Message, ServiceState, ServerState) ->
         %% Result is broken
         Other ->
             send_error("Unknown PB service response: ~p", [Other], ServerState)
-    end.
+    end,
+    profiler:perf_profile({stop, 1}),
+    Ret.
 
 %% @doc Processes a message received from a stream. These are received
 %% on the server process so that we can avoid middlemen, but need to
@@ -489,8 +500,10 @@ update_service_state(Service, NewServiceState, _OldServiceState, #state{states=S
 %% to the client.
 -spec send_encoded_message_or_error(module(), term(), #state{}) -> #state{}.
 send_encoded_message_or_error(Service, ReplyMessage, ServerState) ->
+    profiler:perf_profile({start, 2, "riak_pb_codec:encode"}),
     case Service:encode(ReplyMessage) of
         {ok, Encoded} ->
+	    profiler:perf_profile({stop, 2}),
             send_message(Encoded, ServerState);
         Error ->
             lager:error("PB service ~p could not encode message ~p: ~p",
