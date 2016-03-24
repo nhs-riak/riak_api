@@ -90,7 +90,7 @@ service_registered(Pid, Mod) ->
 %% riak_api_pb_server.
 -spec init(list()) -> {ok, wait_for_socket, #state{}}.
 init([]) ->
-    profiler:perf_profile({prefix, "/Users/eml/projects/riak/riak_test/riak_test_query/server_profiler_results"}),
+    profiler:perf_profile({prefix, "/tmp/server_profiler_results"}),
     riak_api_stat:update(pbc_connect),
     ServiceStates = lists:foldl(fun(Service, States) ->
                                         orddict:store(Service, Service:init(), States)
